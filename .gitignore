@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Environment & Secrets
+.env
+*.local.env
+
+# Database files (keep dev db local, not in repo)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Temp / Audio / Logs
+temp_audio/
+*.log
+.coverage
+htmlcov/
+.pytest_cache/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
