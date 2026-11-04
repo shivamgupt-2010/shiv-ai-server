@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: shivai-router
+    env: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /ping
+    autoDeploy: false
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: false
+      - key: SHIV_AUTH_JWT_SECRET
+        generateValue: true
+      - key: GEMINI_API_KEYS
+        sync: false
+      - key: GROQ_API_KEYS
+        sync: false
+      - key: CEREBRAS_API_KEYS
+        sync: false
+      - key: SAMBANOVA_API_KEYS
+        sync: false
+      - key: MISTRAL_API_KEYS
+        sync: false
+      - key: HUGGINGFACE_TOKENS
+        sync: false
+      - key: OPENROUTER_API_KEYS
+        sync: false
