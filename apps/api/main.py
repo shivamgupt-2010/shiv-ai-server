@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from apps.api.routers import (
     auth_router,
     chat_router,
+    keys_router,
     memory_router,
     multimodal_router,
     system_router,
@@ -129,6 +130,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # Register all API sub-routers
 app.include_router(system_router)
 app.include_router(auth_router)
+app.include_router(keys_router)
 app.include_router(chat_router)
 app.include_router(multimodal_router)
 app.include_router(memory_router)
