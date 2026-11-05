@@ -102,10 +102,10 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# Configure CORS for all clients (Web, Android, Desktop, Codespaces)
+# Configure CORS dynamically for all clients (Web, Vercel, Android, Codespaces)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=r"https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
