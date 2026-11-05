@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -25,6 +26,59 @@ logger = logging.getLogger("shivai.auth.security")
 
 _hasher = PasswordHasher()
 http_bearer = HTTPBearer(auto_error=False)
+
+# In-memory sliding window rate limiter for API keys
+# key_id -> [list of timestamp floats]
+_key_rpm_tracker: Dict[str, list[float]] = {}
+# key_id -> { "date": "YYYY-MM-DD", "count": int }
+_key_daily_tracker: Dict[str, Dict[str, Any]] = {}
+
+
+def check_and_enforce_rate_limit(key_id: str, tier: str, rpm_limit: int, daily_limit: int):
+    """Enforces strict RPM and Daily Request Limits to protect upstream credits."""
+    now = time.time()
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # 1. RPM Sliding Window (60 seconds)
+    timestamps = _key_rpm_tracker.setdefault(key_id, [])
+    # Filter out timestamps older than 60 seconds
+    valid_timestamps = [t for t in timestamps if now - t < 60.0]
+    if len(valid_timestamps) >= rpm_limit:
+        retry_after = int(60.0 - (now - valid_timestamps[0])) + 1
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": {
+                    "code": "RATE_LIMIT_EXCEEDED",
+                    "message": f"Rate limit of {rpm_limit} requests/minute exceeded for tier '{tier}'. Try again in {retry_after}s.",
+                    "tier": tier,
+                    "retry_after_seconds": retry_after,
+                }
+            },
+            headers={"Retry-After": str(retry_after), "X-RateLimit-Limit": str(rpm_limit)},
+        )
+    valid_timestamps.append(now)
+    _key_rpm_tracker[key_id] = valid_timestamps
+
+    # 2. Daily Quota
+    daily_record = _key_daily_tracker.setdefault(key_id, {"date": today_str, "count": 0})
+    if daily_record["date"] != today_str:
+        daily_record["date"] = today_str
+        daily_record["count"] = 0
+
+    if daily_record["count"] >= daily_limit:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": {
+                    "code": "DAILY_QUOTA_EXHAUSTED",
+                    "message": f"Daily quota of {daily_limit} requests reached for tier '{tier}'. Quota resets at 00:00 UTC.",
+                    "tier": tier,
+                }
+            },
+            headers={"X-RateLimit-Limit": str(daily_limit), "X-RateLimit-Remaining": "0"},
+        )
+    daily_record["count"] += 1
 
 
 class UserContext(BaseModel):
@@ -122,7 +176,27 @@ async def get_current_user(
     """
     token = credentials.credentials if credentials else None
     
-    # 1. Bearer Token Verification
+    # 1. Check for API Key in Bearer Token (e.g. Authorization: Bearer shiv_sk_...)
+    if token and token.startswith("shiv_sk_"):
+        key_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        key_record = db_client.get_api_key_by_hash(key_hash)
+        if key_record:
+            scopes = key_record.get("scopes_parsed", {})
+            tier = scopes.get("tier", "free")
+            rpm = scopes.get("rpm", 10 if tier == "free" else 60)
+            daily = scopes.get("daily", 250 if tier == "free" else 10000)
+            check_and_enforce_rate_limit(key_record["id"], tier, rpm, daily)
+            db_client.touch_api_key_usage(key_record["id"])
+            return UserContext(
+                user_id=key_record["project_id"],
+                shiv_id=key_record.get("shiv_id"),
+                email=key_record["email"],
+                username=key_record["username"],
+                role=key_record.get("role", "user"),
+                status=key_record.get("status", "active"),
+            )
+
+    # 2. JWT Bearer Token Verification
     if token:
         payload = decode_jwt_token(token)
         user_id = payload.get("sub") or payload.get("id")
@@ -141,14 +215,14 @@ async def get_current_user(
             status=user.get("status", "active"),
         )
 
-    # 2. X-API-Key Verification (For Server-to-Server or CLI)
+    # 3. X-API-Key Verification (For Server-to-Server, SDKs, or Playground)
     api_key = x_api_key or request.headers.get("x-api-key")
     if api_key:
         valid_master_keys = {
             "shivai-production-key-2026",
             "shiv_sk_7VpCyHo_X0_Q74V2oX3UJgCQ28DASaccElh5NbJ8amU",
         }
-        if api_key in valid_master_keys or api_key.startswith(settings.API_KEY_PREFIX):
+        if api_key in valid_master_keys:
             return UserContext(
                 user_id="shiv_master_admin",
                 shiv_id="SHV-00001",
@@ -156,6 +230,25 @@ async def get_current_user(
                 username="admin",
                 role="super_admin",
                 status="active",
+            )
+        
+        # Database API key lookup
+        key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        key_record = db_client.get_api_key_by_hash(key_hash)
+        if key_record:
+            scopes = key_record.get("scopes_parsed", {})
+            tier = scopes.get("tier", "free")
+            rpm = scopes.get("rpm", 10 if tier == "free" else 60)
+            daily = scopes.get("daily", 250 if tier == "free" else 10000)
+            check_and_enforce_rate_limit(key_record["id"], tier, rpm, daily)
+            db_client.touch_api_key_usage(key_record["id"])
+            return UserContext(
+                user_id=key_record["project_id"],
+                shiv_id=key_record.get("shiv_id"),
+                email=key_record["email"],
+                username=key_record["username"],
+                role=key_record.get("role", "user"),
+                status=key_record.get("status", "active"),
             )
 
     # 3. Development Fallback (only in local debug mode)
