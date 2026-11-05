@@ -23,7 +23,7 @@ logger = logging.getLogger("shivai.router.fallback")
 PROVIDER_CONFIGS = {
     "groq": {
         "base_url": "https://api.groq.com/openai/v1",
-        "default_model": "llama-3.3-70b-versatile",
+        "default_model": "openai/gpt-oss-20b",
     },
     "cerebras": {
         "base_url": "https://api.cerebras.ai/v1",
@@ -90,7 +90,7 @@ class SmartRouter:
                 try:
                     tokens_streamed = 0
                     if provider == "gemini":
-                        model = preferred_model or "gemini-2.0-flash"
+                        model = preferred_model or "gemini-flash-lite-latest"
                         async for chunk in call_gemini(key=key_node.key, messages=messages, model=model, stream=True):
                             tokens_streamed += 1
                             yield chunk
