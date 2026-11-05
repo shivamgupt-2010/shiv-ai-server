@@ -4,12 +4,11 @@ FROM python:3.11-slim
 # Avoid buffering stdout/stderr
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PORT=8000
+    PORT=10000
 
 # Install system dependencies including FFmpeg for multimodal video reels
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    git \
     ffmpeg \
     libsqlite3-dev \
     build-essential \
@@ -23,11 +22,14 @@ COPY requirements.txt .
 # Install Python packages
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy complete project code
+# Copy complete project code including .env
 COPY . .
 
-# Expose standard port
-EXPOSE 8000
+# Ensure data directory exists
+RUN mkdir -p /app/data /app/data/media
 
-# Run FastAPI with Uvicorn
-CMD ["sh", "-c", "uvicorn apps.api.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 2"]
+# Expose standard port
+EXPOSE 10000
+
+# Run FastAPI with Uvicorn (1 worker to remain well within Render free tier 512MB RAM)
+CMD ["sh", "-c", "uvicorn apps.api.main:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1"]
