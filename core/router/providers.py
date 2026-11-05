@@ -28,7 +28,7 @@ class ProviderExecutionError(Exception):
 async def call_gemini(
     key: str,
     messages: List[Dict[str, str]],
-    model: str = "gemini-2.0-flash",
+    model: str = "gemini-flash-lite-latest",
     stream: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Invokes Google Gemini API with SSE streaming or standard return."""
