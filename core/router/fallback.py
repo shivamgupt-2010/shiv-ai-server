@@ -23,7 +23,7 @@ logger = logging.getLogger("shivai.router.fallback")
 PROVIDER_CONFIGS = {
     "groq": {
         "base_url": "https://api.groq.com/openai/v1",
-        "default_model": "openai/gpt-oss-20b",
+        "default_model": "llama-3.3-70b-versatile",
     },
     "cerebras": {
         "base_url": "https://api.cerebras.ai/v1",
@@ -46,6 +46,68 @@ PROVIDER_CONFIGS = {
         "default_model": "meta-llama/Llama-3.2-3B-Instruct",
     },
 }
+
+PROVIDER_MODEL_MAP = {
+    "gemini": {
+        "default": "gemini-flash-lite-latest",
+        "fast": "gemini-flash-lite-latest",
+        "omni": "gemini-flash-lite-latest",
+        "pro": "gemini-pro-latest",
+    },
+    "groq": {
+        "default": "llama-3.3-70b-versatile",
+        "fast": "llama-3.1-8b-instant",
+        "omni": "llama-3.3-70b-versatile",
+    },
+    "cerebras": {
+        "default": "llama3.3-70b",
+        "fast": "llama3.1-8b",
+        "omni": "llama3.3-70b",
+    },
+    "sambanova": {
+        "default": "Meta-Llama-3.3-70B-Instruct",
+        "fast": "Meta-Llama-3.1-8B-Instruct",
+        "omni": "Meta-Llama-3.3-70B-Instruct",
+    },
+    "mistral": {
+        "default": "mistral-small-latest",
+        "fast": "mistral-small-latest",
+        "omni": "mistral-medium-latest",
+    },
+    "openrouter": {
+        "default": "meta-llama/llama-3.3-70b-instruct:free",
+        "fast": "meta-llama/llama-3.3-70b-instruct:free",
+        "omni": "meta-llama/llama-3.3-70b-instruct:free",
+    },
+    "huggingface": {
+        "default": "meta-llama/Llama-3.2-3B-Instruct",
+        "fast": "meta-llama/Llama-3.2-3B-Instruct",
+        "omni": "meta-llama/Llama-3.2-3B-Instruct",
+    },
+}
+
+
+def resolve_provider_model(provider: str, requested_model: Optional[str]) -> str:
+    """
+    Translates virtual sovereign model aliases (e.g. shiv-ai-v2, SHIV-Core-Omni, SHIV-Flash)
+    into the provider's native internal model ID.
+    Preserves strict sovereign abstraction so callers never need provider model names.
+    """
+    mapping = PROVIDER_MODEL_MAP.get(provider, {})
+    if not requested_model:
+        return mapping.get("default", "gemini-flash-lite-latest")
+
+    req_lower = requested_model.lower()
+    # If the user passed a native model name directly
+    if any(k in req_lower for k in ["gemini", "llama", "mistral", "gemma", "qwen", "gpt"]):
+        return requested_model
+
+    if "flash" in req_lower or "fast" in req_lower or "lite" in req_lower:
+        return mapping.get("fast", mapping.get("default", ""))
+    if "pro" in req_lower or "plus" in req_lower:
+        return mapping.get("pro", mapping.get("default", ""))
+    
+    return mapping.get("omni", mapping.get("default", ""))
 
 # Order of provider evaluation
 PROVIDER_PRIORITY = [
@@ -89,15 +151,14 @@ class SmartRouter:
 
                 try:
                     tokens_streamed = 0
+                    model = resolve_provider_model(provider, preferred_model)
                     if provider == "gemini":
-                        model = preferred_model or "gemini-flash-lite-latest"
                         async for chunk in call_gemini(key=key_node.key, messages=messages, model=model, stream=True):
                             tokens_streamed += 1
                             yield chunk
                     else:
                         cfg = PROVIDER_CONFIGS.get(provider, {})
                         base_url = cfg.get("base_url", "")
-                        model = preferred_model or cfg.get("default_model", "")
                         async for chunk in call_openai_compatible(
                             provider_name=provider,
                             base_url=base_url,
