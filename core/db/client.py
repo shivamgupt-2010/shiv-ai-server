@@ -360,6 +360,129 @@ class ShivDBClient:
         finally:
             conn.close()
 
+    # --- API Key & Quota Management Operations ---
+    def create_api_key(
+        self,
+        user_id: str,
+        key_name: str,
+        tier: str = "free",
+    ) -> Dict[str, Any]:
+        """Generates a secure cryptographic API key with tier rate-limiting scopes."""
+        import hashlib
+        import secrets
+        key_id = str(uuid.uuid4())
+        random_suffix = secrets.token_hex(20)
+        prefix_tag = "free" if tier.lower() == "free" else "live"
+        raw_key = f"shiv_sk_{prefix_tag}_{random_suffix}"
+        key_prefix = raw_key[:18]  # e.g. "shiv_sk_free_4f8a"
+        key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+        
+        rpm_limit = 10 if tier == "free" else 60
+        daily_limit = 250 if tier == "free" else 10000
+        scopes = json.dumps({"tier": tier, "rpm": rpm_limit, "daily": daily_limit})
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        conn = self.get_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO api_keys (id, project_id, key_name, key_prefix, key_hash, scopes, revoked, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (key_id, user_id, key_name, key_prefix, key_hash, scopes, now_iso, now_iso),
+            )
+            conn.commit()
+            return {
+                "id": key_id,
+                "key": raw_key,
+                "key_prefix": key_prefix,
+                "key_name": key_name,
+                "tier": tier,
+                "rpm_limit": rpm_limit,
+                "daily_limit": daily_limit,
+                "created_at": now_iso,
+            }
+        finally:
+            conn.close()
+
+    def list_user_api_keys(self, user_id: str) -> List[Dict[str, Any]]:
+        """Lists caller's API keys (secret key itself is never stored or returned)."""
+        conn = self.get_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, key_name, key_prefix, scopes, revoked, last_used_at, created_at
+                FROM api_keys
+                WHERE project_id = ?
+                ORDER BY created_at DESC
+                """,
+                (user_id,),
+            ).fetchall()
+            keys = []
+            for r in rows:
+                k = dict(r)
+                try:
+                    k["scopes_parsed"] = json.loads(k.get("scopes") or "{}")
+                except Exception:
+                    k["scopes_parsed"] = {}
+                keys.append(k)
+            return keys
+        finally:
+            conn.close()
+
+    def revoke_api_key(self, user_id: str, key_id: str) -> bool:
+        """Revokes an API key instantly."""
+        conn = self.get_connection()
+        try:
+            res = conn.execute(
+                "UPDATE api_keys SET revoked = 1, updated_at = ? WHERE id = ? AND project_id = ?",
+                (datetime.now(timezone.utc).isoformat(), key_id, user_id),
+            )
+            conn.commit()
+            return res.rowcount > 0
+        finally:
+            conn.close()
+
+    def get_api_key_by_hash(self, key_hash: str) -> Optional[Dict[str, Any]]:
+        """Looks up an active API key by its SHA-256 hash."""
+        conn = self.get_connection()
+        try:
+            row = conn.execute(
+                """
+                SELECT a.id, a.project_id, a.key_name, a.key_prefix, a.scopes, a.revoked, a.last_used_at,
+                       u.email, u.username, u.role, u.status
+                FROM api_keys a
+                JOIN users u ON u.id = a.project_id
+                WHERE a.key_hash = ? AND a.revoked = 0
+                LIMIT 1
+                """,
+                (key_hash,),
+            ).fetchone()
+            if not row:
+                return None
+            data = dict(row)
+            try:
+                data["scopes_parsed"] = json.loads(data.get("scopes") or "{}")
+            except Exception:
+                data["scopes_parsed"] = {"tier": "free", "rpm": 10, "daily": 250}
+            return data
+        finally:
+            conn.close()
+
+    def touch_api_key_usage(self, key_id: str) -> None:
+        """Updates last_used_at for an active key."""
+        conn = self.get_connection()
+        try:
+            conn.execute(
+                "UPDATE api_keys SET last_used_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), key_id),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
     # --- Telemetry & Audit Logs ---
     def log_audit(
         self,
