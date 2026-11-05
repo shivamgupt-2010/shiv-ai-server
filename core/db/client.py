@@ -25,8 +25,16 @@ class ShivDBClient:
     """Thread-safe SQLite connector to shiv_dev.db with WAL mode and automatic schema verification."""
 
     def __init__(self, db_path: Optional[str] = None):
-        self.db_path = Path(db_path or settings.SHIV_DB_PATH)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        target = db_path or settings.SHIV_DB_PATH
+        # Guard against Windows drive paths on Linux
+        if os.name != 'nt' and target.startswith('F:'):
+            target = "/app/data/shiv_dev.db"
+        self.db_path = Path(target)
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"Could not create database directory for {self.db_path}: {e}")
+            self.db_path = Path("./shiv_dev.db")
         self._ensure_database_initialized()
 
     def get_connection(self) -> sqlite3.Connection:
