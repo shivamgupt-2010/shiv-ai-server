@@ -8,7 +8,7 @@ import hashlib
 import logging
 from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, Field
 
 from core.auth.security import (
     UserContext,
@@ -25,7 +25,13 @@ router = APIRouter(prefix="/auth", tags=["SHIV Native Auth"])
 
 
 class RegisterRequest(BaseModel):
-    email: EmailStr
+    email: str = Field(
+        ...,
+        min_length=5,
+        max_length=255,
+        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+        description="Valid user email address",
+    )
     password: str
     username: str
     display_name: Optional[str] = None
