@@ -49,15 +49,15 @@ PROVIDER_CONFIGS = {
 
 PROVIDER_MODEL_MAP = {
     "gemini": {
-        "default": "gemini-flash-lite-latest",
-        "fast": "gemini-flash-lite-latest",
-        "omni": "gemini-flash-lite-latest",
-        "pro": "gemini-pro-latest",
+        "default": "gemini-3.5-flash",
+        "fast": "gemini-3.5-flash-lite",
+        "omni": "gemini-3.5-flash",
+        "pro": "gemini-3.8-flash",
     },
     "groq": {
-        "default": "llama-3.3-70b-versatile",
-        "fast": "llama-3.1-8b-instant",
-        "omni": "llama-3.3-70b-versatile",
+        "default": "openai/gpt-oss-120b",
+        "fast": "openai/gpt-oss-20b",
+        "omni": "openai/gpt-oss-120b",
     },
     "cerebras": {
         "default": "llama3.3-70b",
@@ -111,8 +111,8 @@ def resolve_provider_model(provider: str, requested_model: Optional[str]) -> str
 
 # Order of provider evaluation
 PROVIDER_PRIORITY = [
-    "gemini",
     "groq",
+    "gemini",
     "cerebras",
     "sambanova",
     "mistral",
@@ -122,24 +122,30 @@ PROVIDER_PRIORITY = [
 
 
 class SmartRouter:
-    """Intelligent inference orchestrator with self-healing failover."""
+    """Intelligent inference orchestrator with self-healing failover and tool calling."""
 
     def __init__(self):
         self.pool = key_pool
 
     async def stream_chat(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         preferred_model: Optional[str] = None,
-    ) -> AsyncGenerator[str, None]:
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Streams completions from the highest-priority available provider.
         Automatically catches rate limits (429), auth failures (401/403), or network errors,
         quarantines the failing key, and seamlessly rotates to the next key or provider.
         """
         attempted_keys = 0
+        priority = list(PROVIDER_PRIORITY)
+        if tools and "groq" in priority:
+            priority.remove("groq")
+            priority.insert(0, "groq")
 
-        for provider in PROVIDER_PRIORITY:
+        for provider in priority:
             # Try available keys in this provider's pool
             while True:
                 key_node = self.pool.get_next_key(provider)
@@ -150,29 +156,34 @@ class SmartRouter:
                 logger.info(f"Routing to [{provider}] with key {key_node.key[:8]}...")
 
                 try:
-                    tokens_streamed = 0
+                    events_streamed = 0
                     model = resolve_provider_model(provider, preferred_model)
                     if provider == "gemini":
                         async for chunk in call_gemini(key=key_node.key, messages=messages, model=model, stream=True):
-                            tokens_streamed += 1
-                            yield chunk
+                            events_streamed += 1
+                            yield {
+                                "delta": {"content": chunk},
+                                "finish_reason": None,
+                            }
                     else:
                         cfg = PROVIDER_CONFIGS.get(provider, {})
                         base_url = cfg.get("base_url", "")
-                        async for chunk in call_openai_compatible(
+                        async for item in call_openai_compatible(
                             provider_name=provider,
                             base_url=base_url,
                             key=key_node.key,
                             messages=messages,
                             model=model,
                             stream=True,
+                            tools=tools,
+                            tool_choice=tool_choice,
                         ):
-                            tokens_streamed += 1
-                            yield chunk
+                            events_streamed += 1
+                            yield item
 
                     # If we yielded content successfully, record success and return
-                    if tokens_streamed > 0:
-                        self.pool.record_success(provider, key_node.key, tokens_used=tokens_streamed)
+                    if events_streamed > 0:
+                        self.pool.record_success(provider, key_node.key, tokens_used=events_streamed)
                         return
 
                 except ProviderExecutionError as p_err:
@@ -189,21 +200,88 @@ class SmartRouter:
         logger.warning("All pooled provider keys exhausted or unconfigured. Engaging zero-cost public emergency fallback...")
         try:
             async for chunk in call_public_fallback(messages=messages, stream=True):
-                yield chunk
+                yield {
+                    "delta": {"content": chunk},
+                    "finish_reason": None,
+                }
         except Exception as e:
             logger.error(f"Critical: Emergency public fallback failed: {str(e)}")
-            yield "I am currently undergoing scheduled system recalibration. Please verify your connection or try again shortly."
+            yield {
+                "delta": {"content": "I am currently undergoing scheduled system recalibration. Please verify your connection or try again shortly."},
+                "finish_reason": "stop",
+            }
 
     async def complete_chat(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         preferred_model: Optional[str] = None,
-    ) -> str:
-        """Non-streaming version of completion."""
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Non-streaming version of completion with full tool call support."""
+        attempted_keys = 0
+        priority = list(PROVIDER_PRIORITY)
+        if tools and "groq" in priority:
+            priority.remove("groq")
+            priority.insert(0, "groq")
+
+        for provider in priority:
+            while True:
+                key_node = self.pool.get_next_key(provider)
+                if not key_node:
+                    break
+
+                attempted_keys += 1
+                try:
+                    model = resolve_provider_model(provider, preferred_model)
+                    if provider == "gemini":
+                        chunks = []
+                        async for chunk in call_gemini(key=key_node.key, messages=messages, model=model, stream=False):
+                            chunks.append(chunk)
+                        self.pool.record_success(provider, key_node.key, tokens_used=len(chunks))
+                        return {
+                            "message": {
+                                "role": "assistant",
+                                "content": "".join(chunks),
+                                "tool_calls": None,
+                            },
+                            "finish_reason": "stop",
+                        }
+                    else:
+                        cfg = PROVIDER_CONFIGS.get(provider, {})
+                        base_url = cfg.get("base_url", "")
+                        async for item in call_openai_compatible(
+                            provider_name=provider,
+                            base_url=base_url,
+                            key=key_node.key,
+                            messages=messages,
+                            model=model,
+                            stream=False,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                        ):
+                            self.pool.record_success(provider, key_node.key, tokens_used=10)
+                            return item
+
+                except ProviderExecutionError as p_err:
+                    self.pool.record_failure(provider, key_node.key, p_err.status_code)
+                    continue
+                except Exception as e:
+                    self.pool.record_failure(provider, key_node.key, 500)
+                    continue
+
+        # Fallback
         chunks = []
-        async for chunk in self.stream_chat(messages=messages, preferred_model=preferred_model):
+        async for chunk in call_public_fallback(messages=messages, stream=False):
             chunks.append(chunk)
-        return "".join(chunks)
+        return {
+            "message": {
+                "role": "assistant",
+                "content": "".join(chunks),
+                "tool_calls": None,
+            },
+            "finish_reason": "stop",
+        }
 
 
 smart_router = SmartRouter()

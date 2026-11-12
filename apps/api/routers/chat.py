@@ -27,7 +27,10 @@ router = APIRouter(prefix="/v1", tags=["Inference & Chat"])
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[Any] = None
+    name: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -37,6 +40,8 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
     user: Optional[str] = None
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = None
 
 
 @router.post("/chat/completions")
@@ -47,7 +52,7 @@ async def chat_completions(
     current_user: UserContext = Depends(get_current_user),
 ):
     """
-    Standard OpenAI-compatible chat completion endpoint.
+    Standard OpenAI-compatible chat completion endpoint with native tool-calling support.
     Automatically enriches prompt with SHIV DB long-term memories and sliding short-term context.
     Sanitizes all outputs to ensure Sovereign SHIV AI Identity.
     """
@@ -59,7 +64,7 @@ async def chat_completions(
     # Extract the last user message for learning and memory
     last_user_message = ""
     for msg in reversed(req.messages):
-        if msg.role == "user":
+        if msg.role == "user" and isinstance(msg.content, str):
             last_user_message = msg.content
             break
 
@@ -67,14 +72,23 @@ async def chat_completions(
     shiv_system = build_shiv_system_prompt(user_id=user_id, user_display_name=user_display)
 
     # 2. Assemble formatted messages with SHIV Persona upfront
-    assembled_messages: List[Dict[str, str]] = [{"role": "system", "content": shiv_system}]
+    assembled_messages: List[Dict[str, Any]] = [{"role": "system", "content": shiv_system}]
 
     for msg in req.messages:
         if msg.role == "system":
             # Append supplementary instructions after master persona
-            assembled_messages.append({"role": "system", "content": msg.content})
+            assembled_messages.append({"role": "system", "content": str(msg.content or "")})
         else:
-            assembled_messages.append({"role": msg.role, "content": msg.content})
+            m_dict: Dict[str, Any] = {"role": msg.role}
+            if msg.content is not None:
+                m_dict["content"] = msg.content
+            if msg.tool_calls:
+                m_dict["tool_calls"] = msg.tool_calls
+            if msg.tool_call_id:
+                m_dict["tool_call_id"] = msg.tool_call_id
+            if msg.name:
+                m_dict["name"] = msg.name
+            assembled_messages.append(m_dict)
 
     # Record user prompt into short-term sliding memory
     if last_user_message:
@@ -85,11 +99,18 @@ async def chat_completions(
         async def event_generator() -> AsyncGenerator[str, None]:
             accumulated_chunks: List[str] = []
             try:
-                async for chunk in smart_router.stream_chat(
+                async for item in smart_router.stream_chat(
                     messages=assembled_messages,
                     preferred_model=req.model,
+                    tools=req.tools,
+                    tool_choice=req.tool_choice,
                 ):
-                    accumulated_chunks.append(chunk)
+                    delta = item.get("delta", {})
+                    finish_reason = item.get("finish_reason")
+                    content_piece = delta.get("content")
+                    if content_piece:
+                        accumulated_chunks.append(content_piece)
+
                     payload = {
                         "id": request_id,
                         "object": "chat.completion.chunk",
@@ -98,28 +119,13 @@ async def chat_completions(
                         "choices": [
                             {
                                 "index": 0,
-                                "delta": {"content": chunk},
-                                "finish_reason": None,
+                                "delta": delta,
+                                "finish_reason": finish_reason,
                             }
                         ],
                     }
                     yield f"data: {json.dumps(payload)}\n\n"
 
-                # Send final stop chunk
-                stop_payload = {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_ts,
-                    "model": "shiv-ai-v2",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(stop_payload)}\n\n"
                 yield "data: [DONE]\n\n"
 
             finally:
@@ -149,13 +155,20 @@ async def chat_completions(
         )
 
     # 4. Handle Standard Synchronous Return
-    full_reply = await smart_router.complete_chat(
+    result = await smart_router.complete_chat(
         messages=assembled_messages,
         preferred_model=req.model,
+        tools=req.tools,
+        tool_choice=req.tool_choice,
     )
 
+    msg_payload = result.get("message", {"role": "assistant", "content": result.get("content", "")})
+    finish_reason = result.get("finish_reason", "tool_calls" if msg_payload.get("tool_calls") else "stop")
+    content_text = msg_payload.get("content") or ""
+
     # Record assistant message into short-term memory
-    short_term_memory.add_message(user_id=user_id, role="assistant", content=full_reply)
+    if content_text:
+        short_term_memory.add_message(user_id=user_id, role="assistant", content=content_text)
 
     # Schedule background memory extraction
     if last_user_message:
@@ -165,8 +178,8 @@ async def chat_completions(
             user_text=last_user_message,
         )
 
-    prompt_toks = sum(len(m.get("content", "")) for m in assembled_messages) // 4
-    compl_toks = len(full_reply) // 4
+    prompt_toks = sum(len(str(m.get("content", ""))) for m in assembled_messages) // 4
+    compl_toks = len(str(content_text)) // 4
 
     return {
         "id": request_id,
@@ -176,11 +189,8 @@ async def chat_completions(
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": full_reply,
-                },
-                "finish_reason": "stop",
+                "message": msg_payload,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {

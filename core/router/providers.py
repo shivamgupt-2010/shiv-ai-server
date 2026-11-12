@@ -80,22 +80,28 @@ async def call_openai_compatible(
     provider_name: str,
     base_url: str,
     key: str,
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     model: str,
     stream: bool = False,
-) -> AsyncGenerator[str, None]:
-    """Invokes any standard OpenAI-compatible chat completion endpoint."""
+    tools: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """Invokes any standard OpenAI-compatible chat completion endpoint with native tool calling."""
     url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
-    payload = {
+    payload: Dict[str, Any] = {
         "model": model,
         "messages": messages,
         "stream": stream,
         "temperature": 0.7,
     }
+    if tools:
+        payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
 
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         if stream:
@@ -111,9 +117,15 @@ async def call_openai_compatible(
                             break
                         try:
                             chunk_obj = json.loads(data_str)
-                            delta = chunk_obj.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                            if delta:
-                                yield sanitize_output(delta)
+                            choice = chunk_obj.get("choices", [{}])[0]
+                            delta = choice.get("delta", {})
+                            finish_reason = choice.get("finish_reason")
+                            if "content" in delta and delta["content"]:
+                                delta["content"] = sanitize_output(delta["content"])
+                            yield {
+                                "delta": delta,
+                                "finish_reason": finish_reason,
+                            }
                         except Exception:
                             pass
         else:
@@ -121,8 +133,20 @@ async def call_openai_compatible(
             if resp.status_code != 200:
                 raise ProviderExecutionError(provider_name, resp.status_code, resp.text)
             data = resp.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            yield sanitize_output(content)
+            choice = data.get("choices", [{}])[0]
+            msg = choice.get("message", {})
+            finish_reason = choice.get("finish_reason", "stop")
+            content = msg.get("content")
+            if content:
+                content = sanitize_output(content)
+            yield {
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": msg.get("tool_calls"),
+                },
+                "finish_reason": finish_reason,
+            }
 
 
 # --- 3. Zero-Cost Public Emergency Fallback ---
